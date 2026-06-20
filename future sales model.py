@@ -1,0 +1,252 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+# Load the data
+df = pd.read_csv(r"C:\Users\nkonj\OneDrive\Desktop\Sales & Demand Forecasting for Businesses\Superstore.csv", encoding='latin-1')
+# Parse dates properly
+df['Order Date'] = pd.to_datetime(df['Order Date'])
+df['Ship Date'] = pd.to_datetime(df['Ship Date'])
+
+# cleaning the data
+
+# 1. Checking and deleting duplicates
+df = df.drop_duplicates()
+
+# 2. drop useless columns
+df = df.drop(columns=['Row ID', 'Customer ID', 'Customer Name', 'Product ID', 'Product Name', 'Postal Code'])
+
+# 3. Extract time-based features from Order Date (key for forecasting)
+df['Order Year'] = df['Order Date'].dt.year
+df['Order Month'] = df['Order Date'].dt.month
+df['Order Day'] = df['Order Date'].dt.day
+
+# 4. Handle negative profits (loss-making orders)
+df['Is Loss'] = df['Profit'] < 0
+
+# 5. Aggregate to monthly sales — this is what we'll actually forecast
+monthly_sales = df.groupby(['Order Year', 'Order Month']).agg(
+    Total_Sales=('Sales', 'sum'),
+    Total_Profit=('Profit', 'sum'),
+    Total_Quantity=('Quantity', 'sum'),
+    Order_Count=('Order ID', 'nunique'),
+    Loss_Orders=('Is Loss', 'sum')
+).reset_index()
+
+# Create a proper date column for the monthly data
+monthly_sales['Date'] = pd.to_datetime({
+    'year':  monthly_sales['Order Year'],
+    'month': monthly_sales['Order Month'],
+    'day':   1
+})
+
+monthly_sales = monthly_sales.sort_values('Date').reset_index(drop=True)
+
+print(monthly_sales.head(10))
+print(f"\nDate range: {monthly_sales['Date'].min()} to {monthly_sales['Date'].max()}")
+print(f"Total months of data: {len(monthly_sales)}")
+
+#  FEATURE ENGINEERING 
+
+# Lag and rolling features (same as before)
+monthly_sales['Sales_Lag_1'] = monthly_sales['Total_Sales'].shift(1)
+monthly_sales['Sales_Lag_4'] = monthly_sales['Total_Sales'].shift(4)
+monthly_sales['Rolling_Avg_4'] = monthly_sales['Total_Sales'].shift(1).rolling(4).mean()
+
+# *** THE FIX ***
+# Problem: with 4 full years of history, a plain integer 'Month' (1-12) lets the
+# model memorize "Nov = high, Feb = low" for every year it has seen, while the
+# underlying year-over-year growth trend gets almost no weight. The result is a
+# forecast that just replays last year's seasonal shape instead of projecting
+# growth forward — which is why the original model's 2018 forecast ($685,757)
+# came in BELOW 2017 actual ($733,215), despite 4 straight years of growth.
+#
+# Fix: give the model an explicit trend signal (Time_Index = months since the
+# start of the dataset) and encode month cyclically (sin/cos) so seasonality is
+# captured as a smooth repeating pattern rather than 12 unrelated categories.
+monthly_sales['Time_Index'] = np.arange(len(monthly_sales))  # 0, 1, 2, ... 47
+monthly_sales['Month_Sin'] = np.sin(2 * np.pi * monthly_sales['Order Month'] / 12)
+monthly_sales['Month_Cos'] = np.cos(2 * np.pi * monthly_sales['Order Month'] / 12)
+
+# Drop rows with NaN (first 4 months can't have lag features)
+monthly_sales = monthly_sales.dropna().reset_index(drop=True)
+
+# Add remaining time features
+monthly_sales['Month']   = monthly_sales['Date'].dt.month
+monthly_sales['Quarter'] = monthly_sales['Date'].dt.quarter
+monthly_sales['Year']    = monthly_sales['Date'].dt.year
+
+# Features and target — Month_Sin/Month_Cos + Time_Index REPLACE raw Month
+features = ['Time_Index', 'Month_Sin', 'Month_Cos', 'Quarter', 'Year',
+            'Sales_Lag_1', 'Sales_Lag_4', 'Rolling_Avg_4']
+X = monthly_sales[features]
+y = monthly_sales['Total_Sales']
+
+# Time-based train/test split — last 6 months as test
+split_index = len(monthly_sales) - 6
+X_train = X.iloc[:split_index]
+X_test  = X.iloc[split_index:]
+y_train = y.iloc[:split_index]
+y_test  = y.iloc[split_index:]
+
+print(f"\nTraining on {len(X_train)} months")
+print(f"Testing on {len(X_test)} months")
+print(f"Test period: {monthly_sales['Date'].iloc[split_index]} to {monthly_sales['Date'].iloc[-1]}")
+
+# TRAIN MODEL 
+
+model = RandomForestRegressor(n_estimators=200, random_state=42)
+model.fit(X_train, y_train)
+
+#  EVALUATE 
+
+y_pred = model.predict(X_test)
+
+mae  = mean_absolute_error(y_test, y_pred)
+rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+mape = np.mean(np.abs((y_test.values - y_pred) / y_test.values)) * 100
+
+print("\n=== MODEL PERFORMANCE (corrected) ===")
+print(f"MAE:  ${mae:,.2f}")
+print(f"RMSE: ${rmse:,.2f}")
+print(f"MAPE: {mape:.1f}%")
+
+#  FEATURE IMPORTANCE 
+
+importance = pd.DataFrame({
+    'Feature':    features,
+    'Importance': model.feature_importances_
+}).sort_values('Importance', ascending=False).reset_index(drop=True)
+
+print("\n=== FEATURE IMPORTANCE (corrected) ===")
+print(importance.to_string(index=False))
+
+#  FORECAST 2018 
+
+# Retrain on ALL data before forecasting future
+model_final = RandomForestRegressor(n_estimators=200, random_state=42)
+model_final.fit(X, y)
+
+# Build future months using rolling lag updates
+last_known = monthly_sales['Total_Sales'].values.tolist()
+last_time_index = monthly_sales['Time_Index'].iloc[-1]
+future_rows = []
+
+for i, month in enumerate(range(1, 13), start=1):
+    row = {
+        'Time_Index':    last_time_index + i,
+        'Month_Sin':     np.sin(2 * np.pi * month / 12),
+        'Month_Cos':     np.cos(2 * np.pi * month / 12),
+        'Quarter':       (month - 1) // 3 + 1,
+        'Year':          2018,
+        'Sales_Lag_1':   last_known[-1],
+        'Sales_Lag_4':   last_known[-4],
+        'Rolling_Avg_4': np.mean(last_known[-4:])
+    }
+    future_rows.append(row)
+    pred = model_final.predict(pd.DataFrame([row])[features])[0]
+    last_known.append(pred)
+
+future_df = pd.DataFrame(future_rows)
+future_df['Predicted_Sales'] = model_final.predict(future_df[features])
+future_df['Date'] = pd.to_datetime({
+    'year': 2018, 'month': range(1, 13), 'day': 1
+})
+
+print("\n=== 2018 MONTHLY FORECAST (corrected) ===")
+print(future_df[['Date', 'Predicted_Sales']].to_string(index=False))
+print(f"\nProjected 2018 Annual Total: ${future_df['Predicted_Sales'].sum():,.2f}")
+print(f"2017 Actual Total:           ${monthly_sales[monthly_sales['Year']==2017]['Total_Sales'].sum():,.2f}")
+
+# PLOT HISTORY + FORECAST 
+
+plt.figure(figsize=(14, 6))
+
+plt.plot(monthly_sales['Date'], monthly_sales['Total_Sales'],
+         label='Historical Sales (2014–2017)', color='steelblue', linewidth=2)
+
+plt.plot(future_df['Date'], future_df['Predicted_Sales'],
+         label='2018 Forecast (corrected)', color='orange',
+         linewidth=2, linestyle='--', marker='o')
+
+plt.axvspan(future_df['Date'].iloc[0], future_df['Date'].iloc[-1],
+            alpha=0.1, color='orange', label='Forecast Period')
+
+# Annotate peak month
+peak_idx = future_df['Predicted_Sales'].idxmax()
+plt.annotate(f"Peak: ${future_df['Predicted_Sales'].iloc[peak_idx]:,.0f}",
+             xy=(future_df['Date'].iloc[peak_idx], future_df['Predicted_Sales'].iloc[peak_idx]),
+             xytext=(0, 15), textcoords='offset points',
+             ha='center', fontsize=9, color='darkorange',
+             arrowprops=dict(arrowstyle='->', color='darkorange'))
+
+plt.title('Superstore Sales — Historical + 2018 Forecast (Corrected: Trend-Aware Model)')
+plt.xlabel('Date')
+plt.ylabel('Total Sales ($)')
+plt.legend()
+plt.tight_layout()
+plt.savefig("forecast_history_corrected.png", dpi=150, bbox_inches='tight')
+plt.close()
+
+#  BUSINESS SUMMARY CHART 
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+fig.suptitle('Superstore Sales Forecast — Business Intelligence Report (Corrected)',
+             fontsize=14, fontweight='bold', y=1.01)
+
+#  Chart 1: Full forecast 
+ax1 = axes[0, 0]
+ax1.plot(monthly_sales['Date'], monthly_sales['Total_Sales'],
+         color='steelblue', linewidth=2, label='Historical')
+ax1.plot(future_df['Date'], future_df['Predicted_Sales'],
+         color='orange', linewidth=2, linestyle='--', marker='o', label='2018 Forecast')
+ax1.axvspan(future_df['Date'].iloc[0], future_df['Date'].iloc[-1],
+            alpha=0.1, color='orange')
+ax1.set_title('Sales History + 2018 Forecast')
+ax1.set_ylabel('Total Sales ($)')
+ax1.legend(fontsize=8)
+ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'${x:,.0f}'))
+
+#  Chart 2: Average sales by month (seasonality) 
+ax2 = axes[0, 1]
+seasonality = monthly_sales.groupby('Month')['Total_Sales'].mean()
+colors = ['red' if v == seasonality.min() else
+          'green' if v == seasonality.max() else
+          'steelblue' for v in seasonality.values]
+ax2.bar(seasonality.index, seasonality.values, color=colors)
+ax2.set_title('Average Sales by Month (Seasonality)')
+ax2.set_xlabel('Month')
+ax2.set_ylabel('Avg Sales ($)')
+ax2.set_xticks(range(1, 13))
+ax2.set_xticklabels(['Jan','Feb','Mar','Apr','May','Jun',
+                      'Jul','Aug','Sep','Oct','Nov','Dec'], fontsize=8)
+ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'${x:,.0f}'))
+
+#    Chart 3: Year over year growth 
+ax3 = axes[1, 0]
+yearly = monthly_sales.groupby('Year')['Total_Sales'].sum()
+yearly_forecast = pd.Series([future_df['Predicted_Sales'].sum()], index=[2018])
+all_years = pd.concat([yearly, yearly_forecast])
+bar_colors = ['steelblue'] * len(yearly) + ['orange']
+ax3.bar(all_years.index, all_years.values, color=bar_colors)
+ax3.set_title('Annual Sales — Year over Year (2018 = Forecast)')
+ax3.set_xlabel('Year')
+ax3.set_ylabel('Total Sales ($)')
+for i, (year, val) in enumerate(all_years.items()):
+    ax3.text(year, val + 5000, f'${val:,.0f}', ha='center', fontsize=8)
+ax3.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'${x:,.0f}'))
+
+#  Chart 4: Feature importance 
+ax4 = axes[1, 1]
+ax4.barh(importance['Feature'], importance['Importance'], color='steelblue')
+ax4.set_title('What Drives the Forecast? (Corrected)')
+ax4.set_xlabel('Importance Score')
+for i, val in enumerate(importance['Importance']):
+    ax4.text(val + 0.005, i, f'{val:.1%}', va='center', fontsize=8)
+
+plt.tight_layout()
+plt.savefig(r"C:\Users\nkonj\OneDrive\Desktop\Sales & Demand Forecasting for Businesses\forecast_report_corrected.png", dpi=150, bbox_inches='tight')
+plt.close()
+print("\nReport saved!")
